@@ -1,561 +1,484 @@
 /**
- * VoidMD Mobile App — React Native
- * 
- * Setup:
+ * VoidMD Chat App v2
+ * UI seperti WhatsApp — ketik command, bot balas
+ *
+ * Install:
  *   npx create-expo-app VoidMDApp --template blank
  *   cd VoidMDApp
- *   npx expo install expo-notifications
- *   npm install @react-navigation/native @react-navigation/bottom-tabs
- *   npx expo install react-native-screens react-native-safe-area-context
- *   npm install react-native-vector-icons
- * 
- * Lalu ganti isi App.js dengan file ini.
+ *   npm install react-native-safe-area-context react-native-screens
+ *   npx expo install @react-native-async-storage/async-storage expo-av expo-image-picker
+ *   Ganti App.js dengan file ini
  */
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
   StyleSheet, StatusBar, ActivityIndicator, Alert,
-  Switch, ScrollView, RefreshControl, Platform,
-  KeyboardAvoidingView, Animated,
+  ScrollView, Platform, KeyboardAvoidingView,
+  Image, Pressable, Animated, Dimensions,
 } from "react-native";
 import { SafeAreaView, SafeAreaProvider } from "react-native-safe-area-context";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
-// ─── CONFIG ─────────────────────────────────────────────────────────────────
-// Ganti dengan IP server kamu saat development, atau domain production
-const API_BASE = "http://192.168.1.100:3001"; // Ganti ini!
-const WS_BASE  = "ws://192.168.1.100:3001";   // Ganti ini!
-const API_TOKEN = "voidmd-secret";             // Samakan dengan config.json bot
+const { width: SW } = Dimensions.get("window");
 
-// ─── Theme ──────────────────────────────────────────────────────────────────
+// ─── Theme ────────────────────────────────────────────────────────────────────
 const C = {
-  bg      : "#0D0D0F",
-  surface : "#18181B",
-  border  : "#27272A",
-  accent  : "#22C55E",
-  accentDim:"#16A34A",
-  danger  : "#EF4444",
-  warn    : "#F59E0B",
-  text    : "#FAFAFA",
-  textMid : "#A1A1AA",
-  textDim : "#52525B",
-  white   : "#FFFFFF",
+  bg        : "#0B141A",
+  surface   : "#1F2C34",
+  bubble_bot: "#1F2C34",
+  bubble_usr: "#005C4B",
+  header    : "#1F2C34",
+  input_bg  : "#2A3942",
+  border    : "#2A3942",
+  accent    : "#00A884",
+  text      : "#E9EDEF",
+  textMid   : "#8696A0",
+  textDim   : "#546E7A",
+  white     : "#FFFFFF",
+  danger    : "#EF4444",
+  time      : "#8696A0",
 };
 
-// ─── API Helper ──────────────────────────────────────────────────────────────
-const api = async (path, method = "GET", body = null) => {
-  const opts = {
+// ─── Storage ──────────────────────────────────────────────────────────────────
+const CFG_KEY  = "@voidmd_cfg";
+let SERVER = { ip: "", token: "voidmd-secret" };
+
+const loadCfg = async () => {
+  try {
+    const v = await AsyncStorage.getItem(CFG_KEY);
+    if (v) SERVER = JSON.parse(v);
+  } catch {}
+};
+
+const saveCfg = async () => {
+  try { await AsyncStorage.setItem(CFG_KEY, JSON.stringify(SERVER)); } catch {}
+};
+
+// ─── API ──────────────────────────────────────────────────────────────────────
+const apiUrl = (p) => `http://${SERVER.ip}:3001${p}`;
+const wsUrl  = ()  => `ws://${SERVER.ip}:3001?token=${SERVER.token}`;
+
+const apiFetch = async (path, method = "GET", body = null) => {
+  const r = await fetch(apiUrl(path), {
     method,
-    headers: { "Content-Type": "application/json", "x-api-key": API_TOKEN },
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const res  = await fetch(`${API_BASE}${path}`, opts);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+    headers: { "Content-Type": "application/json", "x-api-key": SERVER.token },
+    body   : body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+};
+
+// ─── Session ID unik per device ───────────────────────────────────────────────
+let SESSION_ID = null;
+const getSessionId = async () => {
+  if (SESSION_ID) return SESSION_ID;
+  let id = await AsyncStorage.getItem("@voidmd_session");
+  if (!id) { id = `sess_${Date.now()}_${Math.random().toString(36).slice(2)}`; await AsyncStorage.setItem("@voidmd_session", id); }
+  SESSION_ID = id;
+  return id;
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SCREENS
+// CHAT SCREEN
 // ══════════════════════════════════════════════════════════════════════════════
+function ChatScreen({ onOpenSettings }) {
+  const [messages, setMessages]   = useState([]);
+  const [input,    setInput]      = useState("");
+  const [sending,  setSending]    = useState(false);
+  const [botOnline,setBotOnline]  = useState(false);
+  const [botName,  setBotName]    = useState("Void-MD");
+  const [sessionId,setSessionId]  = useState(null);
+  const listRef = useRef(null);
+  const wsRef   = useRef(null);
+  const typingAnim = useRef(new Animated.Value(0)).current;
 
-// ─── Screen: Dashboard ───────────────────────────────────────────────────────
-function DashboardScreen() {
-  const [status, setStatus]     = useState(null);
-  const [loading, setLoading]   = useState(true);
-  const [refresh, setRefresh]   = useState(false);
-  const dotAnim                 = useRef(new Animated.Value(1)).current;
-
-  const pulse = () => {
-    Animated.sequence([
-      Animated.timing(dotAnim, { toValue: 0.2, duration: 600, useNativeDriver: true }),
-      Animated.timing(dotAnim, { toValue: 1,   duration: 600, useNativeDriver: true }),
-    ]).start(pulse);
+  // Typing indicator animation
+  const showTyping = () => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(typingAnim, { toValue: 1, duration: 500, useNativeDriver: true }),
+        Animated.timing(typingAnim, { toValue: 0, duration: 500, useNativeDriver: true }),
+      ])
+    ).start();
   };
-
-  useEffect(() => { pulse(); }, []);
-
-  const load = useCallback(async () => {
-    try {
-      const data = await api("/api/status");
-      setStatus(data);
-    } catch (e) {
-      setStatus(null);
-    } finally {
-      setLoading(false);
-      setRefresh(false);
-    }
-  }, []);
-
-  useEffect(() => { load(); const t = setInterval(load, 10000); return () => clearInterval(t); }, []);
-
-  if (loading) return <Loader />;
-
-  const connected = status?.connected;
-
-  return (
-    <ScrollView
-      style={s.screen}
-      contentContainerStyle={{ padding: 20 }}
-      refreshControl={<RefreshControl refreshing={refresh} onRefresh={() => { setRefresh(true); load(); }} tintColor={C.accent} />}
-    >
-      {/* Status Card */}
-      <View style={[s.card, { borderColor: connected ? C.accent : C.danger }]}>
-        <View style={s.row}>
-          <Animated.View style={[s.dot, { backgroundColor: connected ? C.accent : C.danger, opacity: dotAnim }]} />
-          <Text style={s.cardTitle}>{connected ? "Bot Terhubung" : "Bot Tidak Aktif"}</Text>
-        </View>
-        {connected && (
-          <>
-            <Text style={s.cardBig}>{status.botName || "Void-MD"}</Text>
-            <Text style={s.cardSub}>📱 {status.botPhone}</Text>
-          </>
-        )}
-        {!connected && (
-          <Text style={s.cardSub}>Bot tidak aktif. Jalankan bot di server dulu.</Text>
-        )}
-      </View>
-
-      {/* Stats */}
-      {status && (
-        <>
-          <Text style={s.sectionTitle}>Statistik</Text>
-          <View style={s.grid}>
-            <StatCard label="Uptime"    value={formatUptime(status.uptime)} icon="⏱" />
-            <StatCard label="RAM Used"  value={status.ram?.used || "-"}     icon="💾" />
-            <StatCard label="Total Msg" value={status.totalMessages || "0"} icon="💬" />
-            <StatCard label="PID"       value={String(status.pid || "-")}   icon="⚙️" />
-          </View>
-        </>
-      )}
-    </ScrollView>
-  );
-}
-
-// ─── Screen: Pesan ───────────────────────────────────────────────────────────
-function MessagesScreen() {
-  const [messages, setMessages] = useState([]);
-  const [loading,  setLoading]  = useState(true);
-  const [refresh,  setRefresh]  = useState(false);
-  const wsRef                   = useRef(null);
-
-  const loadMessages = useCallback(async () => {
-    try {
-      const data = await api("/api/messages?limit=100");
-      setMessages(data.messages || []);
-    } catch {}
-    setLoading(false);
-    setRefresh(false);
-  }, []);
 
   useEffect(() => {
-    loadMessages();
+    const init = async () => {
+      const sid = await getSessionId();
+      setSessionId(sid);
 
-    // WebSocket real-time
-    const ws = new WebSocket(`${WS_BASE}?token=${API_TOKEN}`);
-    wsRef.current = ws;
+      if (!SERVER.ip) return;
 
-    ws.onmessage = (e) => {
+      // Cek status bot
       try {
-        const ev = JSON.parse(e.data);
-        if (ev.type === "message") {
-          setMessages(prev => [ev.data, ...prev].slice(0, 100));
+        const s = await apiFetch("/api/status");
+        setBotOnline(s.connected);
+        if (s.botName) setBotName(s.botName);
+      } catch {}
+
+      // Load history
+      try {
+        const h = await apiFetch(`/api/chat/history?sessionId=${sid}&limit=100`);
+        if (h.messages?.length > 0) setMessages(h.messages);
+        else {
+          // Welcome message
+          setMessages([{
+            id  : "welcome",
+            role: "bot",
+            time: Date.now(),
+            type: "text",
+            text: `👋 Halo! Selamat datang di *${botName}*\n\nKetik *.menu* untuk melihat semua command yang tersedia.`,
+          }]);
         }
       } catch {}
-    };
 
-    return () => ws.close();
+      // WebSocket
+      connectWS(sid);
+    };
+    init();
+    return () => wsRef.current?.close();
   }, []);
 
-  if (loading) return <Loader />;
-
-  return (
-    <View style={s.screen}>
-      <FlatList
-        data={messages}
-        keyExtractor={(item, i) => item.id || String(i)}
-        renderItem={({ item }) => <MsgItem msg={item} />}
-        contentContainerStyle={{ padding: 16 }}
-        refreshControl={
-          <RefreshControl refreshing={refresh} onRefresh={() => { setRefresh(true); loadMessages(); }} tintColor={C.accent} />
-        }
-        ListEmptyComponent={<Empty text="Belum ada pesan masuk" />}
-      />
-    </View>
-  );
-}
-
-// ─── Screen: Kirim Pesan ─────────────────────────────────────────────────────
-function SendScreen() {
-  const [to,      setTo]      = useState("");
-  const [text,    setText]    = useState("");
-  const [sending, setSending] = useState(false);
+  const connectWS = (sid) => {
+    if (!SERVER.ip) return;
+    try {
+      const ws = new WebSocket(wsUrl());
+      wsRef.current = ws;
+      ws.onmessage = (e) => {
+        try {
+          const ev = JSON.parse(e.data);
+          if (ev.type === "bot_reply" && ev.sessionId === sid) {
+            setMessages(prev => [...prev, ev.data]);
+            setSending(false);
+          }
+        } catch {}
+      };
+      ws.onclose = () => setTimeout(() => connectWS(sid), 3000);
+    } catch {}
+  };
 
   const send = async () => {
-    const num = to.trim();
-    const msg = text.trim();
-    if (!num || !msg) return Alert.alert("Isi dulu", "Nomor dan pesan harus diisi.");
+    const text = input.trim();
+    if (!text || sending || !sessionId) return;
+    if (!SERVER.ip) { Alert.alert("Server belum dikonfigurasi", "Buka Setelan dulu."); return; }
 
+    const userMsg = { id: `u_${Date.now()}`, role: "user", time: Date.now(), type: "text", text };
+    setMessages(prev => [...prev, userMsg]);
+    setInput("");
     setSending(true);
+    showTyping();
+
     try {
-      await api("/api/send", "POST", { to: num, text: msg });
-      Alert.alert("✅ Terkirim", `Pesan berhasil dikirim ke ${num}`);
-      setText("");
+      const res = await apiFetch("/api/chat/send", "POST", { message: text, sessionId });
+      // Kalau WebSocket tidak konek, pakai response langsung
+      if (res.replies?.length > 0) {
+        setMessages(prev => {
+          // Hindari duplikat jika WS sudah push
+          const ids = new Set(prev.map(m => m.id));
+          const newReplies = res.replies.filter(r => !ids.has(r.id));
+          return [...prev, ...newReplies];
+        });
+      }
     } catch (e) {
-      Alert.alert("❌ Gagal", e.message);
+      const errMsg = { id: `e_${Date.now()}`, role: "bot", time: Date.now(), type: "text", text: `❌ Gagal: ${e.message}` };
+      setMessages(prev => [...prev, errMsg]);
     } finally {
       setSending(false);
     }
   };
 
-  return (
-    <KeyboardAvoidingView
-      style={s.screen}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-    >
-      <ScrollView contentContainerStyle={{ padding: 20 }}>
-        <Text style={s.sectionTitle}>Kirim Pesan via Bot</Text>
-
-        <Text style={s.label}>Nomor Tujuan</Text>
-        <TextInput
-          style={s.input}
-          placeholder="628xxxxxxxxxx"
-          placeholderTextColor={C.textDim}
-          value={to}
-          onChangeText={setTo}
-          keyboardType="phone-pad"
-        />
-
-        <Text style={s.label}>Pesan</Text>
-        <TextInput
-          style={[s.input, { height: 120, textAlignVertical: "top" }]}
-          placeholder="Tulis pesan di sini..."
-          placeholderTextColor={C.textDim}
-          value={text}
-          onChangeText={setText}
-          multiline
-        />
-
-        <TouchableOpacity style={[s.btn, sending && s.btnDisabled]} onPress={send} disabled={sending}>
-          {sending
-            ? <ActivityIndicator color={C.white} />
-            : <Text style={s.btnText}>📤 Kirim Sekarang</Text>}
-        </TouchableOpacity>
-      </ScrollView>
-    </KeyboardAvoidingView>
-  );
-}
-
-// ─── Screen: Settings ────────────────────────────────────────────────────────
-function SettingsScreen() {
-  const [config,   setConfig]   = useState(null);
-  const [loading,  setLoading]  = useState(true);
-  const [saving,   setSaving]   = useState(false);
-  const [prefix,   setPrefix]   = useState(".");
-  const [botname,  setBotname]  = useState("");
-  const [publicMode, setPublic] = useState("onlygc");
-
+  // Auto scroll ke bawah
   useEffect(() => {
-    api("/api/config").then(data => {
-      setConfig(data);
-      setPrefix(data.prefix || ".");
-      setBotname(data.botname || "");
-      setPublic(data.cfg?.public || "onlygc");
-      setLoading(false);
-    }).catch(() => setLoading(false));
-  }, []);
+    if (messages.length > 0) setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
+  }, [messages]);
 
-  const save = async () => {
-    setSaving(true);
-    try {
-      await api("/api/config", "POST", {
-        prefix,
-        botname,
-        cfg: { ...config?.cfg, public: publicMode },
-      });
-      Alert.alert("✅ Tersimpan", "Konfigurasi berhasil diupdate!");
-    } catch (e) {
-      Alert.alert("❌ Gagal", e.message);
-    } finally {
-      setSaving(false);
-    }
+  const renderMsg = ({ item }) => {
+    const isUser = item.role === "user";
+    return (
+      <View style={[s.msgRow, isUser ? s.msgRowUser : s.msgRowBot]}>
+        <View style={[s.bubble, isUser ? s.bubbleUser : s.bubbleBot]}>
+          {/* Text */}
+          {(item.type === "text" || !item.type) && item.text ? (
+            <Text style={s.bubbleText}>{formatText(item.text)}</Text>
+          ) : null}
+
+          {/* Image */}
+          {item.type === "image" && item.media ? (
+            <View>
+              <Image source={{ uri: item.media }} style={s.mediaImg} resizeMode="cover" />
+              {item.caption ? <Text style={[s.bubbleText, { marginTop: 6 }]}>{item.caption}</Text> : null}
+            </View>
+          ) : null}
+
+          {/* Audio */}
+          {item.type === "audio" ? (
+            <View style={s.audioBox}>
+              <Text style={{ fontSize: 24 }}>🎵</Text>
+              <View style={{ flex: 1, marginLeft: 10 }}>
+                <Text style={s.bubbleText}>{item.ptt ? "Voice Note" : "Audio"}</Text>
+                <Text style={s.timeText}>Tap untuk mainkan di pemutar musik</Text>
+              </View>
+            </View>
+          ) : null}
+
+          {/* Video */}
+          {item.type === "video" ? (
+            <View style={s.audioBox}>
+              <Text style={{ fontSize: 24 }}>🎬</Text>
+              <View style={{ flex: 1, marginLeft: 10 }}>
+                <Text style={s.bubbleText}>Video</Text>
+                {item.caption ? <Text style={s.timeText}>{item.caption}</Text> : null}
+              </View>
+            </View>
+          ) : null}
+
+          {/* Sticker */}
+          {item.type === "sticker" && item.media ? (
+            <Image source={{ uri: item.media }} style={s.stickerImg} resizeMode="contain" />
+          ) : null}
+
+          {/* Document */}
+          {item.type === "document" ? (
+            <View style={s.audioBox}>
+              <Text style={{ fontSize: 24 }}>📄</Text>
+              <Text style={[s.bubbleText, { marginLeft: 10 }]}>{item.fileName || "File"}</Text>
+            </View>
+          ) : null}
+
+          <Text style={s.timeText}>{formatTime(item.time)}</Text>
+        </View>
+      </View>
+    );
   };
 
-  if (loading) return <Loader />;
-
   return (
-    <ScrollView style={s.screen} contentContainerStyle={{ padding: 20 }}>
-      <Text style={s.sectionTitle}>Konfigurasi Bot</Text>
-
-      <Text style={s.label}>Nama Bot</Text>
-      <TextInput style={s.input} value={botname} onChangeText={setBotname} placeholderTextColor={C.textDim} />
-
-      <Text style={s.label}>Prefix Command</Text>
-      <TextInput style={s.input} value={prefix} onChangeText={setPrefix} placeholderTextColor={C.textDim} maxLength={3} />
-
-      <Text style={s.label}>Mode Bot</Text>
-      <View style={s.toggleRow}>
-        {["public", "onlygc", "self"].map(m => (
-          <TouchableOpacity
-            key={m}
-            style={[s.chip, publicMode === m && s.chipActive]}
-            onPress={() => setPublic(m)}
-          >
-            <Text style={[s.chipText, publicMode === m && s.chipTextActive]}>{m}</Text>
-          </TouchableOpacity>
-        ))}
+    <View style={{ flex: 1, backgroundColor: C.bg }}>
+      {/* Header */}
+      <View style={s.chatHeader}>
+        <View style={[s.avatar, { backgroundColor: C.accent }]}>
+          <Text style={{ color: C.white, fontWeight: "800", fontSize: 16 }}>V</Text>
+        </View>
+        <View style={{ flex: 1, marginLeft: 12 }}>
+          <Text style={s.chatHeaderName}>{botName}</Text>
+          <Text style={[s.chatHeaderSub, { color: botOnline ? C.accent : C.textDim }]}>
+            {botOnline ? "● Online" : "● Offline"}
+          </Text>
+        </View>
+        <TouchableOpacity onPress={onOpenSettings} style={s.headerBtn}>
+          <Text style={{ fontSize: 20 }}>⚙️</Text>
+        </TouchableOpacity>
       </View>
 
-      <View style={{ height: 20 }} />
+      {/* Messages */}
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={0}>
+        <FlatList
+          ref={listRef}
+          data={messages}
+          keyExtractor={item => item.id}
+          renderItem={renderMsg}
+          contentContainerStyle={{ padding: 12, paddingBottom: 8 }}
+          onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
+        />
 
-      {/* Toggle Settings */}
-      <ToggleRow label="Self Mode"  value={config?.cfg?.selfMode}  onChange={v => setConfig(c => ({ ...c, cfg: { ...c.cfg, selfMode: v } }))} />
-      <ToggleRow label="Auto Read"  value={config?.cfg?.autoRead}  onChange={v => setConfig(c => ({ ...c, cfg: { ...c.cfg, autoRead: v } }))} />
-      <ToggleRow label="Anti Call"  value={config?.cfg?.antiCall}  onChange={v => setConfig(c => ({ ...c, cfg: { ...c.cfg, antiCall: v } }))} />
+        {/* Typing indicator */}
+        {sending && (
+          <View style={[s.msgRow, s.msgRowBot]}>
+            <View style={[s.bubble, s.bubbleBot, { paddingVertical: 12 }]}>
+              <Animated.Text style={[s.bubbleText, { opacity: typingAnim }]}>
+                ● ● ●
+              </Animated.Text>
+            </View>
+          </View>
+        )}
 
-      <TouchableOpacity style={[s.btn, saving && s.btnDisabled]} onPress={save} disabled={saving}>
-        {saving
-          ? <ActivityIndicator color={C.white} />
-          : <Text style={s.btnText}>💾 Simpan Perubahan</Text>}
-      </TouchableOpacity>
-    </ScrollView>
+        {/* Input Bar */}
+        <View style={s.inputBar}>
+          <TextInput
+            style={s.inputField}
+            placeholder="Ketik pesan..."
+            placeholderTextColor={C.textDim}
+            value={input}
+            onChangeText={setInput}
+            multiline
+            maxLength={1000}
+            onSubmitEditing={send}
+          />
+          <TouchableOpacity
+            style={[s.sendBtn, (!input.trim() || sending) && s.sendBtnDisabled]}
+            onPress={send}
+            disabled={!input.trim() || sending}
+          >
+            {sending
+              ? <ActivityIndicator size="small" color={C.white} />
+              : <Text style={{ fontSize: 20 }}>➤</Text>}
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
+    </View>
   );
 }
 
-// ─── Screen: Commands ─────────────────────────────────────────────────────────
-function CommandsScreen() {
-  const [cmds,    setCmds]   = useState({});
-  const [loading, setLoading] = useState(true);
-  const [search,  setSearch] = useState("");
+// ══════════════════════════════════════════════════════════════════════════════
+// SETTINGS SCREEN
+// ══════════════════════════════════════════════════════════════════════════════
+function SettingsScreen({ onBack }) {
+  const [ip,      setIp]      = useState(SERVER.ip);
+  const [token,   setToken]   = useState(SERVER.token);
+  const [status,  setStatus]  = useState(null);
+  const [testing, setTesting] = useState(false);
+  const [saving,  setSaving]  = useState(false);
 
-  useEffect(() => {
-    api("/api/commands").then(d => { setCmds(d.commands || {}); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, []);
+  const test = async () => {
+    if (!ip) return Alert.alert("IP kosong", "Masukkan IP server dulu.");
+    setTesting(true);
+    setStatus(null);
+    SERVER = { ip, token };
+    try {
+      const d = await apiFetch("/api/status");
+      setStatus(d.connected
+        ? `✅ Terhubung! Bot aktif — ${d.botName || "Void-MD"}`
+        : "⚠️ Server aktif tapi bot belum jalan");
+    } catch {
+      setStatus("❌ Gagal konek. Cek IP dan token.");
+      SERVER = { ip: "", token };
+    } finally { setTesting(false); }
+  };
 
-  if (loading) return <Loader />;
-
-  const allTags    = Object.keys(cmds);
-  const filtered   = {};
-  for (const tag of allTags) {
-    const f = cmds[tag].filter(c =>
-      c.cmd.toLowerCase().includes(search.toLowerCase()) ||
-      (c.desc || "").toLowerCase().includes(search.toLowerCase())
-    );
-    if (f.length > 0) filtered[tag] = f;
-  }
+  const save = async () => {
+    if (!ip) return Alert.alert("IP kosong", "Masukkan IP dulu.");
+    setSaving(true);
+    SERVER = { ip, token };
+    await saveCfg();
+    setSaving(false);
+    Alert.alert("✅ Tersimpan", "Konfigurasi berhasil disimpan!");
+    onBack();
+  };
 
   return (
-    <View style={s.screen}>
-      <View style={{ padding: 16, paddingBottom: 8 }}>
-        <TextInput
-          style={s.input}
-          placeholder="🔍 Cari command..."
-          placeholderTextColor={C.textDim}
-          value={search}
-          onChangeText={setSearch}
-        />
+    <View style={{ flex: 1, backgroundColor: C.bg }}>
+      <View style={s.chatHeader}>
+        <TouchableOpacity onPress={onBack} style={s.headerBtn}>
+          <Text style={{ fontSize: 22, color: C.text }}>←</Text>
+        </TouchableOpacity>
+        <Text style={[s.chatHeaderName, { marginLeft: 12 }]}>Konfigurasi Server</Text>
       </View>
-      <ScrollView contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 20 }}>
-        {Object.entries(filtered).map(([tag, list]) => (
-          <View key={tag}>
-            <Text style={s.tagTitle}>{tag.toUpperCase()}</Text>
-            {list.map(cmd => (
-              <View key={cmd.cmd} style={s.cmdItem}>
-                <Text style={s.cmdName}>{global.prefix || "."}{cmd.cmd}</Text>
-                {cmd.desc ? <Text style={s.cmdDesc}>{cmd.desc}</Text> : null}
-              </View>
-            ))}
+      <ScrollView contentContainerStyle={{ padding: 20 }}>
+        <View style={s.infoBox}>
+          <Text style={s.infoText}>💡 Ganti VPS? Cukup ubah IP di sini, tidak perlu rebuild APK!</Text>
+        </View>
+
+        <Text style={s.label}>IP Server / VPS</Text>
+        <TextInput style={s.input} placeholder="38.45.65.8" placeholderTextColor={C.textDim} value={ip} onChangeText={setIp} keyboardType="numeric" />
+
+        <Text style={s.label}>API Token</Text>
+        <TextInput style={s.input} placeholder="voidmd-secret" placeholderTextColor={C.textDim} value={token} onChangeText={setToken} autoCapitalize="none" />
+
+        {status && (
+          <View style={[s.statusBox, {
+            borderColor: status.startsWith("✅") ? C.accent : status.startsWith("⚠️") ? "#F59E0B" : C.danger
+          }]}>
+            <Text style={{ color: C.text }}>{status}</Text>
           </View>
-        ))}
-        {Object.keys(filtered).length === 0 && <Empty text="Command tidak ditemukan" />}
+        )}
+
+        <TouchableOpacity style={[s.btnOutline, testing && { opacity: 0.6 }]} onPress={test} disabled={testing}>
+          {testing ? <ActivityIndicator color={C.accent} /> : <Text style={s.btnOutlineText}>🔌 Test Koneksi</Text>}
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[s.btn, saving && { opacity: 0.6 }]} onPress={save} disabled={saving}>
+          {saving ? <ActivityIndicator color={C.white} /> : <Text style={s.btnText}>💾 Simpan & Mulai Chat</Text>}
+        </TouchableOpacity>
+
+        <View style={{ height: 40 }} />
+        <Text style={[s.label, { textAlign: "center", color: C.textDim }]}>Void-MD Chat v2.0</Text>
+        <Text style={[s.label, { textAlign: "center", color: C.textDim, fontSize: 11 }]}>
+          Aplikasi ini terhubung ke bot WhatsApp kamu.{"\n"}Bot harus aktif dan api-server.js terpasang.
+        </Text>
       </ScrollView>
     </View>
   );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// COMPONENTS
+// APP ROOT
 // ══════════════════════════════════════════════════════════════════════════════
-
-const Loader = () => (
-  <View style={s.center}>
-    <ActivityIndicator size="large" color={C.accent} />
-  </View>
-);
-
-const Empty = ({ text }) => (
-  <View style={s.center}>
-    <Text style={s.textDim}>{text}</Text>
-  </View>
-);
-
-const StatCard = ({ label, value, icon }) => (
-  <View style={s.statCard}>
-    <Text style={{ fontSize: 22 }}>{icon}</Text>
-    <Text style={s.statVal}>{value}</Text>
-    <Text style={s.statLabel}>{label}</Text>
-  </View>
-);
-
-const MsgItem = ({ msg }) => (
-  <View style={s.msgItem}>
-    <View style={s.row}>
-      <View style={[s.msgBadge, msg.isGroup && { backgroundColor: "#1D4ED8" }]}>
-        <Text style={s.msgBadgeText}>{msg.isGroup ? "GC" : "PM"}</Text>
-      </View>
-      <Text style={s.msgFrom}>{msg.fromName || msg.from || "?"}</Text>
-      <Text style={s.msgTime}>{msg.time ? new Date(msg.time).toLocaleTimeString("id-ID") : ""}</Text>
-    </View>
-    <Text style={s.msgText} numberOfLines={2}>{msg.text || `[${msg.type || "media"}]`}</Text>
-  </View>
-);
-
-const ToggleRow = ({ label, value, onChange }) => (
-  <View style={[s.row, { justifyContent: "space-between", marginBottom: 16 }]}>
-    <Text style={s.text}>{label}</Text>
-    <Switch
-      value={!!value}
-      onValueChange={onChange}
-      trackColor={{ false: C.border, true: C.accentDim }}
-      thumbColor={value ? C.accent : C.textDim}
-    />
-  </View>
-);
-
-// ══════════════════════════════════════════════════════════════════════════════
-// NAVIGATION
-// ══════════════════════════════════════════════════════════════════════════════
-
-const TABS = [
-  { key: "dashboard", label: "Home",     icon: "🏠", Screen: DashboardScreen },
-  { key: "messages",  label: "Pesan",    icon: "💬", Screen: MessagesScreen  },
-  { key: "send",      label: "Kirim",    icon: "📤", Screen: SendScreen      },
-  { key: "commands",  label: "Command",  icon: "⌨️", Screen: CommandsScreen  },
-  { key: "settings",  label: "Setelan",  icon: "⚙️", Screen: SettingsScreen  },
-];
-
 export default function App() {
-  const [active, setActive] = useState("dashboard");
-  const { Screen } = TABS.find(t => t.key === active);
+  const [screen, setScreen] = useState("loading");
+
+  useEffect(() => {
+    loadCfg().then(() => {
+      setScreen(SERVER.ip ? "chat" : "settings");
+    });
+  }, []);
+
+  if (screen === "loading") return (
+    <View style={{ flex: 1, backgroundColor: C.bg, justifyContent: "center", alignItems: "center" }}>
+      <ActivityIndicator size="large" color={C.accent} />
+    </View>
+  );
 
   return (
     <SafeAreaProvider>
-      <StatusBar barStyle="light-content" backgroundColor={C.bg} />
+      <StatusBar barStyle="light-content" backgroundColor={C.header} />
       <SafeAreaView style={{ flex: 1, backgroundColor: C.bg }}>
-        {/* Header */}
-        <View style={s.header}>
-          <Text style={s.headerTitle}>🤖 Void-MD</Text>
-          <View style={s.headerDot} />
-        </View>
-
-        {/* Screen */}
-        <View style={{ flex: 1 }}>
-          <Screen />
-        </View>
-
-        {/* Bottom Tab */}
-        <View style={s.tabBar}>
-          {TABS.map(tab => (
-            <TouchableOpacity
-              key={tab.key}
-              style={s.tabItem}
-              onPress={() => setActive(tab.key)}
-            >
-              <Text style={{ fontSize: 20 }}>{tab.icon}</Text>
-              <Text style={[s.tabLabel, active === tab.key && s.tabLabelActive]}>
-                {tab.label}
-              </Text>
-              {active === tab.key && <View style={s.tabIndicator} />}
-            </TouchableOpacity>
-          ))}
-        </View>
+        {screen === "chat"
+          ? <ChatScreen     onOpenSettings={() => setScreen("settings")} />
+          : <SettingsScreen onBack={() => setScreen("chat")} />}
       </SafeAreaView>
     </SafeAreaProvider>
   );
 }
 
-// ─── Utils ───────────────────────────────────────────────────────────────────
-function formatUptime(secs) {
-  if (!secs) return "-";
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  const s = Math.floor(secs % 60);
-  return `${h}j ${m}m ${s}d`;
+// ─── Utils ────────────────────────────────────────────────────────────────────
+function formatTime(ts) {
+  if (!ts) return "";
+  return new Date(ts).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// STYLES
-// ══════════════════════════════════════════════════════════════════════════════
+function formatText(text) {
+  // Bold *text* → tampil normal, React Native tidak support inline bold di Text biasa
+  return text.replace(/\*/g, "").replace(/_/g, "");
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  screen     : { flex: 1, backgroundColor: C.bg },
-  center     : { flex: 1, justifyContent: "center", alignItems: "center", padding: 40 },
-  row        : { flexDirection: "row", alignItems: "center" },
-
   // Header
-  header     : { flexDirection: "row", alignItems: "center", justifyContent: "space-between",
-                  paddingHorizontal: 20, paddingVertical: 14, borderBottomWidth: 1, borderColor: C.border },
-  headerTitle: { color: C.text, fontSize: 18, fontWeight: "700", letterSpacing: 0.5 },
-  headerDot  : { width: 8, height: 8, borderRadius: 4, backgroundColor: C.accent },
+  chatHeader   : { flexDirection: "row", alignItems: "center", backgroundColor: C.header, paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderColor: C.border },
+  chatHeaderName: { color: C.text, fontSize: 17, fontWeight: "700" },
+  chatHeaderSub: { fontSize: 12, marginTop: 1 },
+  avatar       : { width: 40, height: 40, borderRadius: 20, justifyContent: "center", alignItems: "center" },
+  headerBtn    : { padding: 6 },
 
-  // Tab
-  tabBar      : { flexDirection: "row", backgroundColor: C.surface, borderTopWidth: 1, borderColor: C.border,
-                   paddingBottom: Platform.OS === "ios" ? 20 : 8, paddingTop: 8 },
-  tabItem     : { flex: 1, alignItems: "center", gap: 2 },
-  tabLabel    : { color: C.textDim, fontSize: 10 },
-  tabLabelActive: { color: C.accent },
-  tabIndicator: { position: "absolute", bottom: -8, width: 24, height: 2, borderRadius: 1, backgroundColor: C.accent },
+  // Bubbles
+  msgRow       : { marginVertical: 2, flexDirection: "row" },
+  msgRowUser   : { justifyContent: "flex-end" },
+  msgRowBot    : { justifyContent: "flex-start" },
+  bubble       : { maxWidth: SW * 0.78, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, paddingBottom: 4 },
+  bubbleUser   : { backgroundColor: C.bubble_usr, borderTopRightRadius: 0 },
+  bubbleBot    : { backgroundColor: C.bubble_bot, borderTopLeftRadius: 0 },
+  bubbleText   : { color: C.text, fontSize: 15, lineHeight: 21 },
+  timeText     : { color: C.time, fontSize: 11, textAlign: "right", marginTop: 4 },
 
-  // Cards
-  card       : { backgroundColor: C.surface, borderRadius: 16, padding: 20, marginBottom: 16,
-                  borderWidth: 1 },
-  cardTitle  : { color: C.text, fontSize: 16, fontWeight: "600", marginLeft: 10 },
-  cardBig    : { color: C.white, fontSize: 22, fontWeight: "800", marginTop: 8 },
-  cardSub    : { color: C.textMid, fontSize: 13, marginTop: 4 },
+  // Media
+  mediaImg     : { width: SW * 0.65, height: SW * 0.5, borderRadius: 6, marginBottom: 4 },
+  stickerImg   : { width: 120, height: 120 },
+  audioBox     : { flexDirection: "row", alignItems: "center", paddingVertical: 4 },
 
-  // Grid stats
-  grid       : { flexDirection: "row", flexWrap: "wrap", gap: 12 },
-  statCard   : { backgroundColor: C.surface, borderRadius: 14, padding: 16, flex: 1,
-                  minWidth: "45%", alignItems: "center", borderWidth: 1, borderColor: C.border },
-  statVal    : { color: C.white, fontSize: 18, fontWeight: "700", marginTop: 6 },
-  statLabel  : { color: C.textDim, fontSize: 11, marginTop: 2 },
+  // Input
+  inputBar     : { flexDirection: "row", alignItems: "flex-end", paddingHorizontal: 8, paddingVertical: 8, backgroundColor: C.header, gap: 8 },
+  inputField   : { flex: 1, backgroundColor: C.input_bg, borderRadius: 24, paddingHorizontal: 16, paddingVertical: 10, color: C.text, fontSize: 15, maxHeight: 120 },
+  sendBtn      : { width: 44, height: 44, borderRadius: 22, backgroundColor: C.accent, justifyContent: "center", alignItems: "center" },
+  sendBtnDisabled: { backgroundColor: C.textDim },
 
-  // Messages
-  msgItem    : { backgroundColor: C.surface, borderRadius: 12, padding: 14, marginBottom: 10,
-                  borderWidth: 1, borderColor: C.border },
-  msgBadge   : { backgroundColor: C.accentDim, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
-  msgBadgeText:{ color: C.white, fontSize: 10, fontWeight: "700" },
-  msgFrom    : { color: C.text, fontSize: 13, fontWeight: "600", marginLeft: 8, flex: 1 },
-  msgTime    : { color: C.textDim, fontSize: 11 },
-  msgText    : { color: C.textMid, fontSize: 13, marginTop: 6 },
-
-  // Form
-  label      : { color: C.textMid, fontSize: 13, marginBottom: 8, marginTop: 16 },
-  input      : { backgroundColor: C.surface, borderRadius: 12, padding: 14, color: C.text,
-                  fontSize: 15, borderWidth: 1, borderColor: C.border },
-  btn        : { backgroundColor: C.accent, borderRadius: 14, padding: 16, alignItems: "center", marginTop: 24 },
-  btnDisabled: { opacity: 0.6 },
-  btnText    : { color: C.white, fontSize: 16, fontWeight: "700" },
-
-  // Toggles
-  toggleRow  : { flexDirection: "row", gap: 10 },
-  chip       : { flex: 1, paddingVertical: 10, borderRadius: 10, borderWidth: 1,
-                  borderColor: C.border, alignItems: "center" },
-  chipActive : { backgroundColor: C.accent, borderColor: C.accent },
-  chipText   : { color: C.textMid, fontSize: 13 },
-  chipTextActive: { color: C.white, fontWeight: "700" },
-
-  // Commands
-  sectionTitle: { color: C.text, fontSize: 18, fontWeight: "700", marginBottom: 16, marginTop: 8 },
-  tagTitle    : { color: C.accent, fontSize: 12, fontWeight: "700", letterSpacing: 1.5,
-                   marginTop: 20, marginBottom: 8 },
-  cmdItem     : { backgroundColor: C.surface, borderRadius: 10, padding: 12, marginBottom: 8,
-                   borderWidth: 1, borderColor: C.border },
-  cmdName     : { color: C.white, fontSize: 14, fontWeight: "600" },
-  cmdDesc     : { color: C.textMid, fontSize: 12, marginTop: 3 },
-
-  // Dot
-  dot        : { width: 10, height: 10, borderRadius: 5 },
-
-  text       : { color: C.text, fontSize: 15 },
-  textDim    : { color: C.textDim, fontSize: 14 },
+  // Settings
+  label        : { color: C.textMid, fontSize: 13, marginBottom: 8, marginTop: 16 },
+  input        : { backgroundColor: C.surface, borderRadius: 10, padding: 14, color: C.text, fontSize: 15, borderWidth: 1, borderColor: C.border },
+  btn          : { backgroundColor: C.accent, borderRadius: 12, padding: 16, alignItems: "center", marginTop: 16 },
+  btnOutline   : { borderWidth: 1.5, borderColor: C.accent, borderRadius: 12, padding: 16, alignItems: "center", marginTop: 16 },
+  btnOutlineText: { color: C.accent, fontSize: 15, fontWeight: "700" },
+  btnText      : { color: C.white, fontSize: 15, fontWeight: "700" },
+  infoBox      : { backgroundColor: "#0d2118", borderRadius: 10, padding: 12, borderWidth: 1, borderColor: C.accent },
+  infoText     : { color: C.accent, fontSize: 13 },
+  statusBox    : { borderRadius: 10, padding: 12, marginTop: 14, borderWidth: 1 },
 });
