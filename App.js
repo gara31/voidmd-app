@@ -42,7 +42,7 @@ const C = {
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
 const CFG_KEY  = "@voidmd_cfg";
-let SERVER = { ip: "", token: "voidmd-secret" };
+let SERVER = { ip: "", port: "2006", token: "voidmd-secret" };
 
 const loadCfg = async () => {
   try {
@@ -56,8 +56,8 @@ const saveCfg = async () => {
 };
 
 // ─── API ──────────────────────────────────────────────────────────────────────
-const apiUrl = (p) => `http://${SERVER.ip}:3001${p}`;
-const wsUrl  = ()  => `ws://${SERVER.ip}:3001?token=${SERVER.token}`;
+const apiUrl = (p) => `http://${SERVER.ip}:${SERVER.port||2006}${p}`;
+const wsUrl  = ()  => `ws://${SERVER.ip}:${SERVER.port||2006}?token=${SERVER.token}`;
 
 const apiFetch = async (path, method = "GET", body = null) => {
   const r = await fetch(apiUrl(path), {
@@ -324,6 +324,7 @@ function ChatScreen({ onOpenSettings }) {
 // ══════════════════════════════════════════════════════════════════════════════
 function SettingsScreen({ onBack }) {
   const [ip,      setIp]      = useState(SERVER.ip);
+  const [port,    setPort]    = useState(SERVER.port || "2006");
   const [token,   setToken]   = useState(SERVER.token);
   const [status,  setStatus]  = useState(null);
   const [testing, setTesting] = useState(false);
@@ -333,7 +334,7 @@ function SettingsScreen({ onBack }) {
     if (!ip) return Alert.alert("IP kosong", "Masukkan IP server dulu.");
     setTesting(true);
     setStatus(null);
-    SERVER = { ip, token };
+    SERVER = { ip, port, token };
     try {
       const d = await apiFetch("/api/status");
       setStatus(d.connected
@@ -341,14 +342,14 @@ function SettingsScreen({ onBack }) {
         : "⚠️ Server aktif tapi bot belum jalan");
     } catch {
       setStatus("❌ Gagal konek. Cek IP dan token.");
-      SERVER = { ip: "", token };
+      SERVER = { ip: "", port, token };
     } finally { setTesting(false); }
   };
 
   const save = async () => {
     if (!ip) return Alert.alert("IP kosong", "Masukkan IP dulu.");
     setSaving(true);
-    SERVER = { ip, token };
+    SERVER = { ip, port, token };
     await saveCfg();
     setSaving(false);
     Alert.alert("✅ Tersimpan", "Konfigurasi berhasil disimpan!");
@@ -370,6 +371,9 @@ function SettingsScreen({ onBack }) {
 
         <Text style={s.label}>IP Server / VPS</Text>
         <TextInput style={s.input} placeholder="38.45.65.8" placeholderTextColor={C.textDim} value={ip} onChangeText={setIp} keyboardType="numeric" />
+
+        <Text style={s.label}>Port</Text>
+        <TextInput style={s.input} placeholder="2006" placeholderTextColor={C.textDim} value={port} onChangeText={setPort} keyboardType="numeric" />
 
         <Text style={s.label}>API Token</Text>
         <TextInput style={s.input} placeholder="voidmd-secret" placeholderTextColor={C.textDim} value={token} onChangeText={setToken} autoCapitalize="none" />
